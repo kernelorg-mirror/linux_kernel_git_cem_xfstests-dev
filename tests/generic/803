@@ -1,0 +1,106 @@
+#! /bin/bash
+# SPDX-License-Identifier: GPL-2.0
+# Copyright (c) 2026 Red Hat.  All Rights Reserved.
+#
+# FS QA Test No. 803
+#
+# Regression test for group quota evasion via NFS.
+#
+# A user belonging to two groups with quotas enforced on both could bypass
+# group quota by changing a file's group via an NFS client. The NFS server
+# runs as root (real credentials) but impersonates the client user via
+# override_creds() (effective credentials). The old code used
+# has_capability_noaudit(), which checks real credentials, causing
+# XFS_QMOPT_FORCE_RES to be set and bypassing quota checks.
+#
+. ./common/preamble
+_begin_fstest auto quick quota
+
+_cleanup()
+{
+	cd /
+	[ -n "$mpoint" ] && $UMOUNT_PROG $mpoint 2>/dev/null
+	sleep 2
+	[ -n "$exportdir" ] && exportfs -u 127.0.0.1:$exportdir 2>/dev/null
+	_stop_rpcbind
+	$added_to_fsgqa2 && gpasswd -d fsgqa fsgqa2 >> $seqres.full 2>&1
+	rm -rf $tmp.* $mpoint
+}
+
+# Import common functions.
+. ./common/filter
+. ./common/quota
+. ./common/nfs
+
+_require_scratch
+_require_quota
+_require_user
+_require_group fsgqa2
+_require_nfs_server
+_require_nfs_client
+
+_fixed_by_kernel_commit e2f62a9744ebad3bcb6347a648e615026e9efeff \
+	"xfs: fix capability check in xfs"
+
+added_to_fsgqa2=false
+
+_qmount_option "usrquota,grpquota"
+_scratch_mkfs >> $seqres.full 2>&1
+_qmount
+
+# Ensure fsgqa belongs to both fsgqa and fsgqa2 groups.
+if ! id fsgqa | grep -qw fsgqa2; then
+	gpasswd -a fsgqa fsgqa2 >> $seqres.full 2>&1 || \
+		_notrun "Cannot add fsgqa to fsgqa2 group"
+	added_to_fsgqa2=true
+fi
+
+exportdir=$SCRATCH_MNT/exportdir
+mpoint=$TEST_DIR/mpoint-$seq
+nfs_userdir=$mpoint/userdir
+
+mkdir -p $exportdir/userdir $mpoint
+chown fsgqa:fsgqa $exportdir/userdir
+
+setquota -g fsgqa  0 2048 0 0 $SCRATCH_MNT
+setquota -g fsgqa2 0 4096 0 0 $SCRATCH_MNT
+
+# Use exportfs directly so we don't need to deal with /etc/exports file
+exportfs -o rw,insecure,no_root_squash,sync 127.0.0.1:$exportdir \
+	>> $seqres.full 2>&1 || _fail "NFS export of $exportdir failed"
+mount -t nfs -o vers=4 127.0.0.1:$exportdir $mpoint \
+	>> $seqres.full 2>&1 || _fail "NFS mount of $exportdir at $mpoint failed"
+
+# Write a 2MiB file via the NFS share as fsgqa, filling the fsgqa group quota.
+_su fsgqa -c "dd if=/dev/zero of=$nfs_userdir/file1 bs=1M count=2 conv=fsync" \
+	>> $seqres.full 2>&1
+
+# Confirm we hit fsgqa group quota limit, a second write must fail.
+_su fsgqa -c "dd if=/dev/zero of=$nfs_userdir/verify bs=1M count=1 conv=fsync" \
+	>> $seqres.full 2>&1 \
+	&& _fail "fsgqa group quota not enforced after writing 2MiB"
+rm -f $nfs_userdir/verify
+
+# Change file1 group to fsgqa2 using the NFS share.
+_su fsgqa -c "chgrp fsgqa2 $nfs_userdir/file1" \
+	|| _fail "chgrp of file1 to fsgqa2 failed unexpectedly"
+
+# Write a second 2MiB file via NFS as fsgqa.
+_su fsgqa -c "dd if=/dev/zero of=$nfs_userdir/file2 bs=1M count=2 conv=fsync" \
+	>> $seqres.full 2>&1
+
+# Change file2 to group fsgqa2 via using the NFS share.
+_su fsgqa -c "chgrp fsgqa2 $nfs_userdir/file2" \
+	|| _fail "chgrp of file2 to fsgqa2 failed unexpectedly"
+
+# Write a third 2MiB file via the NFS share as fsgqa.
+_su fsgqa -c "dd if=/dev/zero of=$nfs_userdir/file3 bs=1M count=2 conv=fsync" \
+	>> $seqres.full 2>&1
+
+# This chgrp must fail: fsgqa2 is at its 4MiB hardlimit.
+_user_do "chgrp fsgqa2 $nfs_userdir/file3" | \
+	sed "s|$nfs_userdir|MPOINT/userdir|g"
+
+# success, all done
+status=0
+exit
