@@ -74,7 +74,7 @@ General options:
     -S section              exclude the specified section from the config file
     -T                      output timestamps
     -R fmt[,fmt]            generate report in formats specified. Supported
-                              formats: xunit, xunit-quiet
+                              formats: xunit, xunit-quiet, tmt
     --exact-order           run tests in the exact order specified
     --extra-space <size>    require minimum free space on scratch device
     --fs <type>             test the given FSTYP; valid types include:

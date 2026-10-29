@@ -14,6 +14,8 @@ REPORT_ENV_LIST_OPT=("TAPE_DEV" "RMT_TAPE_DEV" "FSSTRESS_AVOID" "FSX_AVOID"
 		     "KCONFIG_PATH" "PERF_CONFIGNAME" "MIN_FSSIZE"
 		     "IDMAPPED_MOUNTS")
 
+TMT_REPORT_RESULT_PROG="${TMT_REPORT_RESULT_PROG:-tmt-report-result}"
+
 encode_xml()
 {
 	cat -v | \
@@ -244,7 +246,122 @@ _xunit_make_testcase_report()
 }
 
 
-#
+
+_tmt_assert_env()
+{
+	if [ -z "$TMT_TEST_PIDFILE" ]; then
+		_fatal "report format 'tmt' can only be used when xfstests is run as a tmt test"
+	fi
+	if ! command -v "$TMT_REPORT_RESULT_PROG" >/dev/null 2>&1; then
+		_fatal "report format 'tmt' requires $TMT_REPORT_RESULT_PROG to be installed"
+	fi
+}
+
+# tmt subresult names have to be unique within a tmt test, so prefix each test
+# name with its specific section.
+_tmt_testcase_name()
+{
+	local sect_name="$1"
+	local test_name="$2"
+
+	if [ $sect_name == '-no-sections-' ]; then
+		echo "/$test_name"
+	else
+		echo "/$sect_name/$test_name"
+	fi
+}
+
+__tmt_log_append()
+{
+	local log="$1"
+	local title="$2"
+	local file="$3"
+
+	test -s "$file" || return 0
+	echo "--- $title ---" >> "$log"
+	cat "$file" | tr -dc '[:print:][:space:]' >> "$log"
+	echo >> "$log"
+}
+
+# tmt-report-result can attach a single log to a subresult and display that
+# on its web interface. Gather whatever logs a specific test left behind
+# so we can see it on the web interface instead of digging into the resulting
+# artifacts. Do that only for failed / notrun tests as we don't need it if a test
+# passed properly.
+_tmt_make_testcase_log()
+{
+	local test_name="$1"
+	local test_status="$2"
+	local log="${REPORT_DIR}/${test_name}.tmt.log"
+
+	# $REPORT_DIR/<group> is created by check before the test is run
+	rm -f "$log"
+
+	case $test_status in
+	"notrun")
+		__tmt_log_append "$log" "not run" "${REPORT_DIR}/${test_name}.notrun"
+		;;
+	"fail")
+		local out_src="${SRC_DIR}/${test_name}.out"
+		local outbad_file="${REPORT_DIR}/${test_name}.out.bad"
+
+		if [ -n "$_err_msg" ]; then
+			echo "$_err_msg" >> "$log"
+		fi
+		if [ -s "$outbad_file" ]; then
+			echo "--- output mismatch ---" >> "$log"
+			$diff "$out_src" "$outbad_file" >> "$log"
+		fi
+		__tmt_log_append "$log" "hints" "${REPORT_DIR}/${test_name}.hints"
+		__tmt_log_append "$log" "dmesg" "${REPORT_DIR}/${test_name}.dmesg"
+		__tmt_log_append "$log" "mount failures" "${REPORT_DIR}/${test_name}.mountfail"
+		__tmt_log_append "$log" "full output" "${REPORT_DIR}/${test_name}.full"
+		;;
+	esac
+
+	test -s "$log" && echo "$log"
+	return 0
+}
+
+_tmt_make_testcase_report()
+{
+	local sect_name="$1"
+	local test_name="$2"
+	local test_status="$3"
+	local outcome
+	local log
+
+	case $test_status in
+	"pass")
+		outcome="pass"
+		;;
+	"fail")
+		outcome="fail"
+		;;
+	"notrun"|"list")
+		outcome="skip"
+		;;
+	*)
+		outcome="error"
+		;;
+	esac
+
+	log=`_tmt_make_testcase_log "$test_name" "$test_status"`
+
+	# tmt-report-result is chatty on stdout, which would interleave with
+	# the test results printed by check.
+	"$TMT_REPORT_RESULT_PROG" \
+		"`_tmt_testcase_name "$sect_name" "$test_name"`" \
+		"$outcome" ${log:+-o "$log"} >/dev/null ||
+		echo "check: failed to report $test_name to tmt"
+}
+
+# Only useful if using tmt locally, but keeps consistent with xunit implementation
+_tmt_make_section_report()
+{
+	echo "tmt report: $TMT_TEST_DATA/tmt-report-results.yaml"
+}
+
 #  Common report generator entry points
 _make_section_report()
 {
@@ -259,6 +376,9 @@ _make_section_report()
 			_xunit_make_section_report "$sect_name" "$tests_count" \
 						   "$bad_count" "$notrun_count" \
 						   "$sect_time"
+			;;
+		"tmt")
+			_tmt_make_section_report
 			;;
 		*)
 			_dump_err "format '$report' is not supported"
@@ -279,6 +399,10 @@ _make_testcase_report()
 			_xunit_make_testcase_report "$sect_name" "$test_seq" \
 						    "$test_status" "$test_time" "$report"
 			;;
+		"tmt")
+			_tmt_make_testcase_report "$sect_name" "$test_seq" \
+						  "$test_status"
+			;;
 		*)
 			_dump_err "report format '$report' is not supported"
 			;;
@@ -290,6 +414,9 @@ _assert_report_list() {
 	for report in $REPORT_LIST; do
 		case "$report" in
 		"xunit"|"xunit-quiet")
+			;;
+		"tmt")
+			_tmt_assert_env
 			;;
 		*)
 			_fatal "report format '$report' is not supported"
